@@ -1,0 +1,1143 @@
+---
+title: "AlumniCase"
+author: "Luke McConnell"
+date: "4/19/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r - Workspace Load}
+
+
+setwd("~/Desktop/UT Semester 8/BAS 479 - Analytics Capstone/Alumni Case") #on laptop
+#setwd("C:/Users/lmcconnell/Downloads") #at work
+
+load("S19AmountChallenge.RData")
+load("S19DonateChallenge.RData")
+AREACODES <- read.csv("validareacodes.csv")
+
+library(regclass)
+library(parallel)
+library(doParallel)
+library(caret)
+
+propose_levelsS19 <- function(DATA,method="none",threshold=0,newname="Combined",target=4,train.rows=NA,seed=NA) {
+  
+  if( length(train.rows)>1 ) { 
+    if( mean(complete.cases(DATA[train.rows,])) < 1 ) { stop("The train.rows of DATA cannot contain any missing values")} 
+  } else {
+  
+  if( mean(complete.cases(DATA)) < 1 ) { stop("Object cannot contain any missing values")} }
+
+  require(discretization)
+
+  #First combine any rare levels if requested if threshold > 0
+  if(threshold == 0 | is.na(threshold)) { invisible("Not doing anything") } else { 
+    x <- c()
+    if(class(DATA) %in% c("character","factor") ) {  x <- factor(DATA) }
+    if(class(DATA) %in% c("matrix","data.frame") ) {
+      if( class(DATA[,1]) %in% c("character","factor")) { x <- factor(DATA[,1]) } }
+    if(class(x) == "factor") {
+      rare.levels <- names( which( sort( table(x) ) <= threshold ) )
+      if(length(rare.levels)>0) { 
+        levels(x)[ which(levels(x) %in% rare.levels) ] <- newname
+        ST <- sort(table(x))
+        if(ST[newname]<=threshold) {  #If combined is still rare, combine that with next most rare level
+          levels.to.combine <- which( levels(x) %in% c(newname,names(ST)[2]))
+          levels(x)[levels.to.combine] <- newname
+          rare.levels <- c(rare.levels,names(ST)[2]) }
+      }
+      if(class(DATA) %in% c("character","factor") ) {  DATA <- x }
+      if(class(DATA) %in% c("matrix","data.frame") ) { DATA[,1] <- x } }
+    if( class(x) == "NULL" ) { stop("Cannot combine rare levels of x unless is a categorical variables")}
+  }
+  
+  #If didn't request discretization, we're done
+  if(method=="none") { return(factor(x)) }
+  
+  #Handle case where unsupervised discretization is taking place (DATA MUST BE a numerical VECTOR)
+  if( class(DATA) %in% c("numeric","integer") & method %in% c("interval","frequency","cluster") ) {
+    if( class(DATA) %in% c("numeric","integer") ) { 
+      old.values <- DATA
+      if( !is.na(seed) ) { set.seed(seed) }  #Set random number seed if seed was passed as argument
+      x.cluster <- factor( discretize(DATA,method=method,breaks=target ) )
+      return(factor(x.cluster))
+    } }
+  
+  #Now do supervised discretization cases; now need to worry whether to do it to whole data or just training
+  #HALFDISC is be name of dataframe where discretization is derived from here on out
+  
+  if(class(DATA)=="matrix") { DATA <- as.data.frame(DATA) }
+  if( !(class(DATA)=="data.frame") ) { stop("Supervised discretization requires dataframe with 1st column x 2nd column y")}
+  if( ncol(DATA) != 2 ) { stop("Supervised discretization requires dataframe with 1st column x 2nd column y") }
+  
+  #x (1st column) should be levels to combine; y (2nd column) should be what you're using to suggest levels
+  
+  names(DATA) <- c("x","y")
+  DATA$rownumber <- 1:nrow(DATA)
+  #If a vector of training rows is given, make sure to respect that; discretization scheme should be developed on training
+  if( length(train.rows)>1 ) { HALFDISC <- DATA[train.rows,] } else { HALFDISC <- DATA }
+ 
+  ###################################################################################################################
+  #Case of numerical x and numerical y; mdlp or tree recommended 
+  ###################################################################################################################
+  
+  #Supervised x=numerical; y=numerical
+  #data(WINE)
+  #DATA <- WINE[,c("alcohol","density")]
+  #target <- 4; train.rows <- sample(nrow(DATA),0.5*nrow(DATA))
+  #names(DATA) <- c("x","y")
+  #DATA$rownumber <- 1:nrow(DATA)
+  #if( length(train.rows)>1 ) { HALFDISC <- DATA[train.rows,] } else { HALFDISC <- DATA }
+  
+  if( (class(HALFDISC$x) %in% c("numeric","integer","logical")) & class(HALFDISC$y) %in% c("numeric","integer","logical") ) {
+    
+    if(method=="tree") { 
+      TREE <- rpart(y~x,data=HALFDISC,cp=0)
+      T2 <- prune(TREE,cp=TREE$cptable[max( which(TREE$cptable[,2] <= (target-1) ) ),1] )
+      D <- data.frame(fitted=sort(unique(predict(T2))),newlevel=paste("new",target:1,sep=""))
+      MERGED <- DATA
+      MERGED$fitted <- predict(T2,newdata=DATA)
+      MERGED <- merge(MERGED,D,by="fitted")
+      MERGED <- MERGED[order(MERGED$rownumber),]
+    }
+    
+    if (method == "mdlp" ) {
+      disc.scheme <- mdlp(HALFDISC[,c("x","y")])
+      cutoffs <- sort( unlist( disc.scheme$cutp ) )
+      if(cutoffs[1] != "All" ) { thresholds <- c(min(HALFDISC$x), cutoffs, max(HALFDISC$x))  } else { 
+        thresholds <- c(-Inf,Inf)
+      }
+      MERGED <- DATA
+      MERGED$newlevel <- factor(paste("new",pmin(pmax(sapply(DATA$x,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep=""))
+    }
+    
+    if( method %in% c("interval","frequency","cluster") ) {
+      A <- aggregate(y~x,data=HALFDISC,FUN=median)
+      HALFDISC <- merge(HALFDISC,A,by="x")
+      if( !is.na(seed) ) { set.seed(seed) }  #Set random number seed if seed was passed as argument
+      thresholds <- discretize(HALFDISC$y.y,method=method,breaks=target,onlycuts = TRUE)
+      HALFDISC$newlevel <- factor(paste("new",pmin(pmax(sapply(HALFDISC$y.y,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep=""))
+      HALFDISC <- HALFDISC[,c("x","newlevel")]
+      HALFDISC <- HALFDISC[!duplicated(HALFDISC),]
+      MERGED <- merge(DATA,HALFDISC,by="x",all.x=TRUE)
+      to.do <- which(is.na(MERGED$newlevel))
+      if(length(to.do)>0) { 
+        for ( n in to.do ) {
+          MERGED$newlevel[n] <- HALFDISC$newlevel[ which.min( abs( MERGED$x[n] - HALFDISC$x ) ) ]
+        } }
+    } 
+    
+    MERGED <- MERGED[order(MERGED$rownumber),]
+    return(factor(MERGED$newlevel))
+  }
+  
+  
+  
+  ###################################################################################################################
+  #Case of numerical x and categorical y; mdlp or tree recommended 
+  ###################################################################################################################
+  
+  #Supervised x=numerical; y=categorical
+  #data(WINE)
+  #DATA <- WINE[,c("alcohol","Quality")]
+  #target <- 4; train.rows <- sample(nrow(DATA),0.5*nrow(DATA))
+  #names(DATA) <- c("x","y")
+  #DATA$rownumber <- 1:nrow(DATA)
+  #if( length(train.rows)>1 ) { HALFDISC <- DATA[train.rows,] } else { HALFDISC <- DATA }
+  
+  
+  if( (class(HALFDISC$x) %in% c("numeric","integer","logical")) & class(HALFDISC$y) %in% c("character","factor") ) {
+    if( method=="tree" ) { 
+      TREE <- rpart(y~x,data=HALFDISC,cp=0)
+      T2 <- prune(TREE,cp=TREE$cptable[max( which(TREE$cptable[,2] <= (target-1) ) ),1] )
+      MERGED <- DATA
+      MERGED$newlevel <- as.numeric( factor( predict(T2,newdata=DATA)[,2] ) )
+      MERGED$newlevel <- max(MERGED$newlevel)-MERGED$newlevel+1
+      MERGED$newlevel <- factor(paste("new",MERGED$newlevel,sep=""))
+    }
+    if( method=="mdlp" ) {
+      disc.scheme <- mdlp(HALFDISC[,c("x","y")])
+      cutoffs <- sort( unlist( disc.scheme$cutp ) )
+      if(cutoffs[1] != "All" ) { thresholds <- c(min(HALFDISC$x), cutoffs, max(HALFDISC$x))  } else { 
+        thresholds <- c(-Inf,Inf) }
+      MERGED <- DATA
+      MERGED$newlevel <- factor(paste("new",pmin(pmax(sapply(DATA$x,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep=""))
+    }
+    if( method %in% c("interval","frequency","cluster") ) {
+      A <- aggregate(y~x,data=HALFDISC,FUN=function(x)mean(x==levels(HALFDISC$y)[1]))
+      HALFDISC <- merge(HALFDISC,A,by="x")
+      if( !is.na(seed) ) { set.seed(seed) }  #Set random number seed if seed was passed as argument
+      thresholds <- discretize(HALFDISC$y.y,method=method,breaks=target,onlycuts = TRUE)
+      HALFDISC$newlevel <- factor(paste("new",pmin(pmax(sapply(HALFDISC$y.y,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep=""))
+      HALFDISC <- HALFDISC[,c("x","newlevel")]
+      HALFDISC <- HALFDISC[!duplicated(HALFDISC),]
+      MERGED <- merge(DATA,HALFDISC,by="x",all.x=TRUE)
+      to.do <- which(is.na(MERGED$newlevel))
+      if(length(to.do)>0) { 
+      for ( n in to.do ) {
+        MERGED$newlevel[n] <- HALFDISC$newlevel[ which.min( abs( MERGED$x[n] - HALFDISC$x ) ) ]
+      } }
+    }
+     MERGED <- MERGED[order(MERGED$rownumber),]
+    return(factor(MERGED$newlevel))
+  }
+  
+  
+  
+  ###################################################################################################################
+  #Case of categorical x and categorical y (replace levels by proportions of y, combine levels; mdlp not recommended
+  ###################################################################################################################
+  
+  
+  #Supervised  x=categorical; y=categorical
+  #DATA <- EX6.CLICK[,c("DeviceModel","Click")]; target <- 4; train.rows <- sample(nrow(DATA),0.5*nrow(DATA))
+  #names(DATA) <- c("x","y")
+  #DATA$rownumber <- 1:nrow(DATA)
+  #if( length(train.rows)>1 ) { HALFDISC <- DATA[train.rows,] } else { HALFDISC <- DATA }
+  
+  
+  if( sum( c(class(HALFDISC$y),class(HALFDISC$x)) %in% c("character","factor")) == 2 ) {
+  #Add a column to HALFDISC (will be called y.y) that contains the proportion 
+  A <- aggregate(y~x,data=HALFDISC,FUN=function(x)mean(x==levels(HALFDISC$y)[1]))
+  HALFDISC <- merge(HALFDISC,A,by="x")
+  
+  #x are levels you want to combine, y.y is numerical and will be used in combining
+  
+  if(method=="tree") { 
+    TREE <- rpart(y.y~x,data=HALFDISC,cp=0)
+    T2 <- prune(TREE,cp=TREE$cptable[max( which(TREE$cptable[,2] <= (target-1) ) ),1] )
+    MERGED <- DATA
+    MERGED$newlevel <- as.numeric( factor( predict(T2,newdata=DATA) ) )
+    MERGED$newlevel <- max(MERGED$newlevel)-MERGED$newlevel+1
+    MERGED$newlevel <- factor(paste("new",MERGED$newlevel,sep=""))
+  }
+  if( method %in% c("interval","frequency","cluster") ) {
+    if( !is.na(seed) ) { set.seed(seed) }  #Set random number seed if seed was passed as argument
+    thresholds <- discretize(HALFDISC$y.y,method=method,breaks=target,onlycuts = TRUE)
+  } 
+  if (method == "mdlp" ) {
+    disc.scheme <- mdlp(HALFDISC[,c("y.y","x")])
+    cutoffs <- sort( unlist( disc.scheme$cutp ) )
+    if(cutoffs[1] != "All" ) { thresholds <- c(min(HALFDISC$y.y), cutoffs, max(HALFDISC$y.y) )  } else { 
+      thresholds <- c(-Inf,Inf) }
+  }
+  if( method %in% c("mdlp","interval","frequency","cluster") ) { 
+    A$newlevel <- paste("new",pmin(pmax(sapply(A$y,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep="")
+    MERGED <- merge(DATA,A,by="x")
+  }
+  MERGED <- MERGED[order(MERGED$rownumber),]
+  return(factor(MERGED$newlevel))
+  }
+  
+  ############################################################################################
+  #Case of numerical y and categorical x (mdlp not recommended)
+  ############################################################################################
+  
+  
+  
+  #Supervised  x=categorical; y=numerical
+  #data(DONOR)
+  #DATA <- DONOR[,c("URBANICITY","MEDIAN_HOME_VALUE")]
+  #DATA <- DATA[complete.cases(DATA),]
+  #target <- 3; train.rows <- sample(nrow(DATA),0.5*nrow(DATA))
+  #names(DATA) <- c("x","y")
+  #DATA$rownumber <- 1:nrow(DATA)
+  #if( length(train.rows)>1 ) { HALFDISC <- DATA[train.rows,] } else { HALFDISC <- DATA }
+  
+  if( (class(HALFDISC$x) %in% c("character","factor")) & class(HALFDISC$y) %in% c("numeric","integer","logical") ) {
+  A <- aggregate(y~x,data=HALFDISC,FUN=median)
+  HALFDISC <- merge(HALFDISC,A,by="x")
+  
+  #Tree approach for combining levels based on numerical y
+  if(method=="tree") { 
+    TREE <- rpart(y.x~x,data=HALFDISC,cp=0)
+    T2 <- prune(TREE,cp=TREE$cptable[max( which(TREE$cptable[,2] <= (target-1) ) ),1] )
+    D <- data.frame(fitted=sort(unique(predict(T2))),newlevel=paste("new",1:target,sep=""))
+    MERGED <- DATA
+    MERGED$fitted <- predict(T2,newdata=DATA)
+    MERGED <- merge(MERGED,D,by="fitted")
+    MERGED <- MERGED[order(MERGED$rownumber),]
+  }
+
+  if( method %in% c("interval","frequency","cluster") ) {
+      if( !is.na(seed) ) { set.seed(seed) }  #Set random number seed if seed was passed as argument
+      thresholds <- discretize(HALFDISC$y.y,method=method,breaks=target,onlycuts = TRUE)
+  } 
+  if (method == "mdlp" ) {
+    disc.scheme <- mdlp(HALFDISC[,c("y.y","x")])
+    cutoffs <- sort( unlist( disc.scheme$cutp ) )
+    if(cutoffs[1] != "All" ) { thresholds <- c(min(HALFDISC$y.y), cutoffs, max(HALFDISC$y.y) )  } else { 
+      thresholds <- c(-Inf,Inf) }
+  }
+  if( method %in% c("mdlp","interval","frequency","cluster") ) { 
+    A$newlevel <- paste("new",pmin(pmax(sapply(A$y,function(x)sum(x>=thresholds)),1),length(thresholds)-1),sep="")
+    MERGED <- merge(DATA,A,by="x")
+  }
+  MERGED <- MERGED[order(MERGED$rownumber),]
+  return(factor(MERGED$newlevel))
+  }
+
+  }
+```
+
+```{r - AMOUNT Data Cleaning}
+
+AMOUNT.BACKUP <- AMOUNT
+colnames(AMOUNT)
+
+AMOUNT$LOGAMOUNT_DUP <- AMOUNT$LOGAMOUNT
+
+AMOUNT$LOGAMOUNT_DUP[which(is.na(AMOUNT$LOGAMOUNT_DUP))] <- 0
+
+#ID - identifier variable, not useful for predicting
+
+#GENDER_CODE
+levels(AMOUNT$GENDER_CODE) #Male and female currently exist, leaving U as a level for unknown
+
+#CITY
+length(levels(AMOUNT$CITY)) #2065 cities exist, too many levels, propose like levels
+
+levels(AMOUNT$CITY)[ which(levels(AMOUNT$CITY) %in% c(""," ")) ] <- "Unknown"
+AMOUNT$CITY <- droplevels(AMOUNT$CITY)
+
+newlevels <- propose_levelsS19(AMOUNT[,c("CITY", "LOGAMOUNT_DUP")],method="tree",threshold=100,newname="Other",target=23)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$CITY,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+AMOUNT$CITY <- newlevels
+AMOUNT$CITY <- droplevels(AMOUNT$CITY)
+
+#STATE_CODE
+length(levels(AMOUNT$STATE_CODE)) #56 states exist, keep as is
+levels(AMOUNT$STATE_CODE)[ which(levels(AMOUNT$STATE_CODE) %in% c(""," ")) ] <- "Unknown"
+
+AMOUNT$STATE_CODE <- droplevels(AMOUNT$STATE_CODE)
+
+#ZIPCODE
+length(levels(AMOUNT$ZIPCODE)) #3853 zip codes exist, remove from dataset
+
+AMOUNT$ZIPCODE <- NULL
+
+#POINT_OF_CONTACT - self created to replace PHONE and EMAIL
+for (i in 1:length(AMOUNT$HAVE_PHONE)) {
+  if (AMOUNT$HAVE_PHONE[i] == "Yes" & AMOUNT$EMAIL_ADDRESS[i] == "Present") {AMOUNT$POINTS_OF_CONTACT[i] <- "Two"} else {
+    if (AMOUNT$HAVE_PHONE[i] == "Yes" | AMOUNT$EMAIL_ADDRESS[i] == "Present") {AMOUNT$POINTS_OF_CONTACT[i] <- "One"} else {
+      AMOUNT$POINTS_OF_CONTACT[i] <- "None"
+    }
+  }
+}
+
+AMOUNT$POINTS_OF_CONTACT <- as.factor(AMOUNT$POINTS_OF_CONTACT)
+levels(AMOUNT$POINTS_OF_CONTACT)
+
+#HAVE_PHONE
+levels(AMOUNT$HAVE_PHONE) #yes and no exist, remove from dataset
+
+AMOUNT$HAVE_PHONE <- NULL
+
+#EMAIL_ADDRESS
+levels(AMOUNT$EMAIL_ADDRESS) #missing and present exist, consider combining phone and email into a "# of points of contact" predictor
+
+AMOUNT$EMAIL_ADDRESS <- NULL
+
+#MOST_RECENT_GRAD_YEAR
+AMOUNT$DEGREE2_GRAD_DATE[which(is.na(AMOUNT$DEGREE2_GRAD_DATE))] <- 0
+
+for (i in 1:length(AMOUNT$DEGREE1_GRAD_DATE)) {
+  AMOUNT$MOST_RECENT_GRAD_YEAR[i] <- max(AMOUNT$DEGREE1_GRAD_DATE[i], AMOUNT$DEGREE2_GRAD_DATE[i])
+}
+
+for (i in 1:length(AMOUNT$MOST_RECENT_GRAD_YEAR)) {
+  if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1955 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1960) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1955-1960"} else
+    if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1960 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1965) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1960-1965"} else
+      if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1965 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1970) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1965-1970"} else
+        if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1970 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1975) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1970-1975"} else
+          if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1975 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1980) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1975-1980"} else
+            if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1980 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1985) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1980-1985"} else
+              if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1985 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1990) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1985-1990"} else
+                if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1990 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 1995) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1990-1995"} else
+                  if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 1995 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 2000) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1995-2000"} else
+                    if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 2000 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 2005) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2000-2005"} else
+                      if (AMOUNT$MOST_RECENT_GRAD_YEAR[i] >= 2005 & AMOUNT$MOST_RECENT_GRAD_YEAR[i] < 2010) {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2005-2010"} else {AMOUNT$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2010-2015"} }
+
+AMOUNT$MOST_RECENT_GRAD_YEAR_BIN <- as.factor(AMOUNT$MOST_RECENT_GRAD_YEAR_BIN)
+AMOUNT$MOST_RECENT_GRAD_YEAR <- NULL
+
+#DEGREE1_GRAD_DATE
+min(AMOUNT$DEGREE1_GRAD_DATE) #from 1955 to 2015, consider making a most recent graduation date predictor
+
+AMOUNT$DEGREE1_GRAD_DATE <- NULL
+
+#DEGREE1_CAMPUS
+levels(AMOUNT$DEGREE1_CAMPUS) #HSC, UTC, UTK, & UTM exist
+
+#DEGREE1_DEGREE
+levels(AMOUNT$DEGREE1_DEGREE) #24 levels, some missing
+levels(AMOUNT$DEGREE1_DEGREE)[ which(levels(AMOUNT$DEGREE1_DEGREE) == " ") ] <- "Unknown"
+levels(AMOUNT$DEGREE1_DEGREE)[ which(levels(AMOUNT$DEGREE1_DEGREE) == "Bachelor of Science in Chemical Eng") ] <- "Combined"
+levels(AMOUNT$DEGREE1_DEGREE)[ which(levels(AMOUNT$DEGREE1_DEGREE) == "Master of Fine Arts") ] <- "Combined"
+
+#DEGREE1_SCHOOL
+levels(AMOUNT$DEGREE1_SCHOOL) #39 levels, some missing
+levels(AMOUNT$DEGREE1_SCHOOL)[ which(levels(AMOUNT$DEGREE1_SCHOOL) == "Bus & Pub Aff - Martin") ] <- "Combined"
+levels(AMOUNT$DEGREE1_SCHOOL)[ which(levels(AMOUNT$DEGREE1_SCHOOL) == "Educ - Martin") ] <- "Combined"
+levels(AMOUNT$DEGREE1_SCHOOL)[ which(levels(AMOUNT$DEGREE1_SCHOOL) == "Libr & Info Sci - UTK") ] <- "Combined"
+
+
+#DEGREE1_MAJOR
+levels(AMOUNT$DEGREE1_MAJOR) #181 levels
+
+levels(AMOUNT$DEGREE1_MAJOR)[ which(levels(AMOUNT$DEGREE1_MAJOR) == " ") ] <- "Unknown"
+
+newlevels <- propose_levelsS19(AMOUNT[,c("DEGREE1_MAJOR", "LOGAMOUNT_DUP")],method="tree",newname="Other",target=50)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$DEGREE1_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+AMOUNT$DEGREE1_MAJOR <- newlevels
+AMOUNT$DEGREE1_MAJOR <- droplevels(AMOUNT$DEGREE1_MAJOR)
+
+#DEGREE2_GRAD_DATE
+AMOUNT$DEGREE2_GRAD_DATE #lots of NAs
+
+#NUMBER_OF_DEGREES
+for (i in 1:length(AMOUNT$DEGREE2_GRAD_DATE)) {
+  if (AMOUNT$DEGREE2_GRAD_DATE[i] == 0) {AMOUNT$NUMBER_OF_DEGREES[i] <- 1} else {AMOUNT$NUMBER_OF_DEGREES[i] <- 2}
+}
+
+AMOUNT$DEGREE2_GRAD_DATE <- NULL
+AMOUNT$NUMBER_OF_DEGREES <- as.factor(AMOUNT$NUMBER_OF_DEGREES)
+
+#DEGREE2_CAMPUS
+levels(AMOUNT$DEGREE2_CAMPUS) #HSC, UTC, UTK, UTM, UT Medical Center, UTN, and blank exist
+
+levels(AMOUNT$DEGREE2_CAMPUS)[ which(levels(AMOUNT$DEGREE2_CAMPUS) == " ") ] <- "None"
+levels(AMOUNT$DEGREE2_CAMPUS)[ which(levels(AMOUNT$DEGREE2_CAMPUS) == "UTN") ] <- "UTM"
+AMOUNT$DEGREE2_CAMPUS <- droplevels(AMOUNT$DEGREE2_CAMPUS)
+
+#DEGREE2_DEGREE
+levels(AMOUNT$DEGREE2_DEGREE) #25 levels, some missing
+
+levels(AMOUNT$DEGREE2_DEGREE)[ which(levels(AMOUNT$DEGREE2_DEGREE) == " ") ] <- "None"
+
+#DEGREE2_SCHOOL
+length(levels(AMOUNT$DEGREE2_SCHOOL)) #46 levels, some missing, consider removing - XXX to create more common levels
+
+levels(AMOUNT$DEGREE2_SCHOOL)[ which(levels(AMOUNT$DEGREE2_SCHOOL) == " ") ] <- "None"
+
+#DEGREE2_MAJOR
+length(levels(AMOUNT$DEGREE2_MAJOR)) #155 levels
+
+levels(AMOUNT$DEGREE2_MAJOR)[ which(levels(AMOUNT$DEGREE2_MAJOR) == " ") ] <- "None"
+
+newlevels <- propose_levelsS19(AMOUNT[,c("DEGREE2_MAJOR", "LOGAMOUNT_DUP")],method="tree",newname="Other",target=55)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$DEGREE2_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+AMOUNT$DEGREE2_MAJOR <- newlevels
+AMOUNT$DEGREE2_MAJOR <- droplevels(AMOUNT$DEGREE2_MAJOR)
+
+#NON.UT_DEGREE
+levels(AMOUNT$NON.UT_DEGREES) #yes and no   
+
+#SpouseGradUT
+levels(AMOUNT$SpouseGradUT) #blank and yes
+
+levels(AMOUNT$SpouseGradUT)[ which(levels(AMOUNT$SpouseGradUT) == "") ] <- "No"
+
+#SPOUSE_NON_UT_DEGREES
+levels(AMOUNT$SPOUSE_NON_UT_DEGREES) #no and yes
+
+#RELATIONS_UT
+levels(AMOUNT$RELATIONS_UT) #missing and present
+
+#FRATERNITY.SORORITY
+levels(AMOUNT$FRATERNITY.SORORITY) #still a few multiple fraternity levels, not sure how to resolve
+
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "") ] <- "None"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK -  Alpha Epsilon Pi ") ] <- "UTK - Alpha Epsilon Pi"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK -  Alpha Tau Omega") ] <- "UTK - Alpha Tau Omega"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Alpha Delta Pi; UTK - Alpha Delta Pi") ] <- "UTK - Alpha Delta Pi"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Delta Delta Delta; UTK - Delta Delta Delta") ] <- "UTK - Delta Delta Delta"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Delta Sigma Theta; UTK - Delta Sigma Theta") ] <- "UTK - Delta Sigma Theta"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Kappa Alpha ") ] <- "UTK - Kappa Alpha"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Kappa Sigma; UTK - Kappa Sigma") ] <- "UTK - Kappa Sigma"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Phi Gamma Delta; UTK - Phi Beta Sigma") ] <- "UTK - Phi Gamma Delta"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Phi Gamma Delta; UTK - Phi Gamma Delta; UTK - Phi Gamma Delta") ] <- "UTK - Phi Gamma Delta"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Pi Beta Phi; UTK - Pi Beta Phi") ] <- "UTK - Pi Beta Phi"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Pi Kappa Alpha; UTK - Pi Kappa Alpha") ] <- "UTK - Pi Kappa Alpha"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Phi Gamma Delta; UTK - Phi Gamma Delta") ] <- "UTK - Phi Gamma Delta"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Pi Kappa Phi; UTK -  Alpha Tau Omega") ] <- "UTK - Pi Kappa Phi"
+levels(AMOUNT$FRATERNITY.SORORITY)[ which(levels(AMOUNT$FRATERNITY.SORORITY) == "UTK - Pi Kappa Phi; UTK - Pi Kappa Alpha") ] <- "UTK - Pi Kappa Phi"
+
+#STUDENT.LIFE
+levels(AMOUNT$STUDENT.LIFE) #n and y
+
+#X1ST_GIFT_UT
+min(AMOUNT$X1ST_GIFT_UT) #year that the first gift was made, all rows have donated at least once
+max(AMOUNT$X1ST_GIFT_UT) #44 levels
+
+AMOUNT$X1ST_GIFT_UT <- as.factor(AMOUNT$X1ST_GIFT_UT)
+
+#WE
+levels(AMOUNT$WE) #13 levels for wealth estimate
+
+#LOGAMOUNT
+min(AMOUNT$LOGAMOUNT) #5000 NAs, make sure not to use LOGAMOUNT for predictions
+AMOUNT$LOGAMOUNT[which(is.na(AMOUNT$LOGAMOUNT))]
+```
+
+```{r - DONATE Data Cleaning}
+
+DONATE.BACKUP <- DONATE
+colnames(DONATE)
+
+DONATE$Donated_Dup <- DONATE$Donated
+
+DONATE$Donated_Dup[which(is.na(DONATE$Donated_Dup))] <- "No"
+
+#ID - identifier variable, not useful for predicting
+
+#GENDER_CODE
+levels(DONATE$GENDER_CODE) #Male and female currently exist, leaving U as a level for unknown
+
+#CITYNOW
+length(levels(DONATE$CITYNOW)) #3331 cities exist, too many levels, propose like levels
+
+levels(DONATE$CITYNOW)[ which(levels(DONATE$CITYNOW) %in% c(""," ")) ] <- "Unknown"
+DONATE$CITYNOW[which(is.na(DONATE$CITYNOW))] <- "Unknown"
+DONATE$CITYNOW <- droplevels(DONATE$CITYNOW)
+
+newlevels <- propose_levelsS19(DONATE[,c("CITYNOW", "Donated_Dup")],method="tree",threshold=100,newname="Other",target=23)
+
+levels(newlevels)
+
+TR <- table(DONATE$CITYNOW,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$CITYNOW <- newlevels
+DONATE$CITYNOW <- droplevels(DONATE$CITYNOW)
+
+#STATE_CODE
+length(levels(DONATE$STATE_CODE)) #55 states exist, keep as is
+levels(DONATE$STATE_CODE)[ which(levels(DONATE$STATE_CODE) %in% c(""," ")) ] <- "Unknown"
+
+DONATE$STATE_CODE <- droplevels(DONATE$STATE_CODE)
+
+#ZIPCODE
+length(levels(DONATE$ZIPCODE)) #6172 zip codes exist, remove from dataset
+
+DONATE$ZIPCODE <- NULL
+
+#AREA_CODE - use vlookup with area code list to get region #HELP
+length(levels(DONATE$AREA_CODE))
+
+DONATE$AREA_CODE <- NULL
+
+#EMAIL_ADDRESS
+levels(DONATE$EMAIL_ADDRESS) #missing and present exist
+
+#JOB_TITLE - consider making an "executive category"
+levels(DONATE$JOB_TITLE)
+levels(DONATE$JOB_TITLE)[ which(levels(DONATE$JOB_TITLE) %in% c(""," ")) ] <- "Unknown"
+
+newlevels <- propose_levelsS19(DONATE[,c("JOB_TITLE", "Donated_Dup")],method="tree",threshold=750,newname="Other",target=3)
+
+levels(newlevels)
+
+TR <- table(DONATE$JOB_TITLE,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$JOB_TITLE <- newlevels
+
+#CITY_JOB
+length(levels(DONATE$CITYJOB))
+levels(DONATE$CITYJOB)[ which(levels(DONATE$CITYJOB) == "") ] <- "Unknown"
+
+newlevels <- propose_levelsS19(DONATE[,c("CITYJOB", "Donated_Dup")],method="tree",threshold=15,newname="Other",target=20)
+
+levels(newlevels)
+
+TR <- table(DONATE$CITYJOB,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$CITYJOB <- newlevels
+
+#MOST_RECENT_GRAD_YEAR
+DONATE$DEGREE2_GRAD_DATE[which(is.na(DONATE$DEGREE2_GRAD_DATE))] <- 0
+DONATE$DEGREE3_GRAD_DATE[which(is.na(DONATE$DEGREE3_GRAD_DATE))] <- 0
+DONATE$DEGREE4_GRAD_DATE[which(is.na(DONATE$DEGREE4_GRAD_DATE))] <- 0
+DONATE$DEGREE5_GRAD_DATE[which(is.na(DONATE$DEGREE5_GRAD_DATE))] <- 0
+
+for (i in 1:length(DONATE$DEGREE1_GRAD_DATE)) {
+  DONATE$MOST_RECENT_GRAD_YEAR[i] <- max(DONATE$DEGREE1_GRAD_DATE[i], DONATE$DEGREE2_GRAD_DATE[i], DONATE$DEGREE3_GRAD_DATE[i], DONATE$DEGREE4_GRAD_DATE[i], DONATE$DEGREE5_GRAD_DATE[i])
+}
+
+min(DONATE$MOST_RECENT_GRAD_YEAR)
+max(DONATE$MOST_RECENT_GRAD_YEAR)
+
+for (i in 1:length(DONATE$MOST_RECENT_GRAD_YEAR)) {
+  if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1955 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1960) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1955-1960"} else
+    if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1960 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1965) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1960-1965"} else
+      if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1965 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1970) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1965-1970"} else
+        if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1970 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1975) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1970-1975"} else
+          if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1975 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1980) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1975-1980"} else
+            if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1980 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1985) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1980-1985"} else
+              if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1985 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1990) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1985-1990"} else
+                if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1990 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 1995) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1990-1995"} else
+                  if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 1995 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 2000) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "1995-2000"} else
+                    if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 2000 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 2005) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2000-2005"} else
+                      if (DONATE$MOST_RECENT_GRAD_YEAR[i] >= 2005 & DONATE$MOST_RECENT_GRAD_YEAR[i] < 2010) {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2005-2010"} else {DONATE$MOST_RECENT_GRAD_YEAR_BIN[i] <- "2010-2015"} }
+
+DONATE$MOST_RECENT_GRAD_YEAR_BIN <- as.factor(DONATE$MOST_RECENT_GRAD_YEAR_BIN)
+DONATE$MOST_RECENT_GRAD_YEAR <- NULL
+
+#DEGREE1_GRAD_DATE - DEGREE5_GRAD_DATE
+min(DONATE$DEGREE1_GRAD_DATE) #from 1955 to 2015, consider making a most recent graduation date predictor
+
+DONATE$DEGREE1_GRAD_DATE <- NULL
+DONATE$DEGREE2_GRAD_DATE <- NULL
+DONATE$DEGREE3_GRAD_DATE <- NULL
+DONATE$DEGREE4_GRAD_DATE <- NULL
+DONATE$DEGREE5_GRAD_DATE <- NULL
+
+#DEGREE1_CAMPUS - DEGREE5_CAMPUS
+levels(DONATE$DEGREE1_CAMPUS) #HSC, UTC, UTK, & UTM exist
+levels(DONATE$DEGREE1_CAMPUS)[ which(levels(DONATE$DEGREE1_CAMPUS) == "UTN") ] <- "UTM"
+
+levels(DONATE$DEGREE2_CAMPUS)
+levels(DONATE$DEGREE2_CAMPUS)[ which(levels(DONATE$DEGREE2_CAMPUS) == " ") ] <- "None"
+levels(DONATE$DEGREE2_CAMPUS)[ which(levels(DONATE$DEGREE2_CAMPUS) == "UTN") ] <- "UTM"
+
+levels(DONATE$DEGREE3_CAMPUS)
+levels(DONATE$DEGREE3_CAMPUS)[ which(levels(DONATE$DEGREE3_CAMPUS) == " ") ] <- "None"
+
+levels(DONATE$DEGREE4_CAMPUS)
+levels(DONATE$DEGREE4_CAMPUS)[ which(levels(DONATE$DEGREE4_CAMPUS) == " ") ] <- "None"
+
+levels(DONATE$DEGREE5_CAMPUS)
+levels(DONATE$DEGREE5_CAMPUS)[ which(levels(DONATE$DEGREE5_CAMPUS) == " ") ] <- "None"
+
+#DEGREE1_DEGREE - DEGREE5_DEGREE
+levels(DONATE$DEGREE1_DEGREE) #24 levels, some missing
+levels(DONATE$DEGREE1_DEGREE)[ which(levels(DONATE$DEGREE1_DEGREE) == " ") ] <- "Unknown"
+
+levels(DONATE$DEGREE2_DEGREE)
+levels(DONATE$DEGREE2_DEGREE)[ which(levels(DONATE$DEGREE2_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$DEGREE3_DEGREE)
+levels(DONATE$DEGREE3_DEGREE)[ which(levels(DONATE$DEGREE3_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$DEGREE4_DEGREE)
+levels(DONATE$DEGREE4_DEGREE)[ which(levels(DONATE$DEGREE4_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$DEGREE5_DEGREE)
+levels(DONATE$DEGREE5_DEGREE)[ which(levels(DONATE$DEGREE5_DEGREE) == " ") ] <- "None"
+
+#DEGREE1_SCHOOL - DEGREE5_SCHOOL
+levels(DONATE$DEGREE1_SCHOOL)
+levels(DONATE$DEGREE1_SCHOOL)[ which(levels(DONATE$DEGREE1_SCHOOL) == " ") ] <- "Unknown"
+
+levels(DONATE$DEGREE2_SCHOOL)
+levels(DONATE$DEGREE2_SCHOOL)[ which(levels(DONATE$DEGREE2_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$DEGREE3_SCHOOL)
+levels(DONATE$DEGREE3_SCHOOL)[ which(levels(DONATE$DEGREE3_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$DEGREE4_SCHOOL)
+levels(DONATE$DEGREE4_SCHOOL)[ which(levels(DONATE$DEGREE4_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$DEGREE5_SCHOOL)
+levels(DONATE$DEGREE5_SCHOOL)[ which(levels(DONATE$DEGREE5_SCHOOL) == " ") ] <- "None"
+
+#NUMBER_OF_DEGREES
+levels(DONATE$DEGREE2_MAJOR)[ which(levels(DONATE$DEGREE2_MAJOR) == " ") ] <- "None"
+levels(DONATE$DEGREE3_MAJOR)[ which(levels(DONATE$DEGREE3_MAJOR) == " ") ] <- "None"
+levels(DONATE$DEGREE4_MAJOR)[ which(levels(DONATE$DEGREE4_MAJOR) == " ") ] <- "None"
+levels(DONATE$DEGREE5_MAJOR)[ which(levels(DONATE$DEGREE5_MAJOR) == " ") ] <- "None"
+
+for (i in 1:length(DONATE$DEGREE1_MAJOR)) {
+  if (DONATE$DEGREE1_MAJOR[i] == "None") {DONATE$NUMBER_OF_DEGREES[i] <- 0} else 
+    if (DONATE$DEGREE2_MAJOR[i] == "None") {DONATE$NUMBER_OF_DEGREES[i] <- 1} else
+      if (DONATE$DEGREE3_MAJOR[i] == "None") {DONATE$NUMBER_OF_DEGREES[i] <- 2} else
+        if (DONATE$DEGREE4_MAJOR[i] == "None") {DONATE$NUMBER_OF_DEGREES[i] <- 3} else
+          if (DONATE$DEGREE5_MAJOR[i] == "None") {DONATE$NUMBER_OF_DEGREES[i] <- 4} else
+          {DONATE$NUMBER_OF_DEGREES[i] <- 5}
+}
+
+min(DONATE$NUMBER_OF_DEGREES)
+max(DONATE$NUMBER_OF_DEGREES)
+
+DONATE$NUMBER_OF_DEGREES <- as.factor(DONATE$NUMBER_OF_DEGREES)
+
+#DEGREE1_MAJOR
+length(levels(DONATE$DEGREE1_MAJOR)) #225 levels
+
+newlevels <- propose_levelsS19(DONATE[,c("DEGREE1_MAJOR", "Donated_Dup")],method="tree",newname="Other",target=50)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$DEGREE1_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$DEGREE1_MAJOR <- newlevels
+DONATE$DEGREE1_MAJOR <- droplevels(DONATE$DEGREE1_MAJOR)
+
+#DEGREE2_MAJOR
+length(levels(DONATE$DEGREE2_MAJOR)) #191 levels
+
+newlevels <- propose_levelsS19(DONATE[,c("DEGREE2_MAJOR", "Donated_Dup")],method="tree",newname="Other",target=74)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$DEGREE1_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$DEGREE2_MAJOR <- newlevels
+DONATE$DEGREE2_MAJOR <- droplevels(DONATE$DEGREE2_MAJOR)
+
+#DEGREE3_MAJOR
+length(levels(DONATE$DEGREE3_MAJOR)) #85 levels
+
+newlevels <- propose_levelsS19(DONATE[,c("DEGREE3_MAJOR", "Donated_Dup")],method="tree",newname="Other",target=50)
+
+levels(newlevels)
+
+TR <- table(AMOUNT$DEGREE1_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$DEGREE3_MAJOR <- newlevels
+DONATE$DEGREE3_MAJOR <- droplevels(DONATE$DEGREE3_MAJOR)
+
+#DEGREE4_MAJOR
+length(levels(DONATE$DEGREE4_MAJOR)) #18 levels
+
+#DEGREE5_MAJOR
+length(levels(DONATE$DEGREE5_MAJOR))
+
+#NON.UT_DEGREE
+levels(DONATE$NON.UT_DEGREES) #yes and no
+
+newlevels <- propose_levelsS19(DONATE[,c("NON.UT_DEGREES", "Donated_Dup")],method="tree",newname="Other",threshold=15)
+
+levels(newlevels)
+
+TR <- table(DONATE$NON.UT_DEGREES,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$NON.UT_DEGREES <- newlevels
+DONATE$NON.UT_DEGREES <- droplevels(DONATE$NON.UT_DEGREES)
+
+#SpouseGradUT
+levels(DONATE$SpouseGradUT) #blank and yes
+
+levels(DONATE$SpouseGradUT)[ which(levels(DONATE$SpouseGradUT) == "") ] <- "No"
+
+#SPOUSE_D1_GRAD_DATE - SP_D4_GRAD_DATE
+DONATE$SPOUSE_D1_GRAD_DATE[which(is.na(DONATE$SPOUSE_D1_GRAD_DATE))] <- 0
+DONATE$SP_D2_GRAD_DATE[which(is.na(DONATE$SP_D2_GRAD_DATE))] <- 0
+DONATE$SP_D3_GRAD_DATE[which(is.na(DONATE$SP_D3_GRAD_DATE))] <- 0
+DONATE$SP_D4_GRAD_DATE[which(is.na(DONATE$SP_D4_GRAD_DATE))] <- 0
+
+for (i in 1:length(DONATE$SPOUSE_D1_GRAD_DATE)) {
+  DONATE$SP_MOST_RECENT_GRAD_YEAR[i] <- max(DONATE$SPOUSE_D1_GRAD_DATE[i], DONATE$SP_D2_GRAD_DATE[i], DONATE$SP_D3_GRAD_DATE[i], DONATE$SP_D4_GRAD_DATE[i])}
+
+min(DONATE$SP_MOST_RECENT_GRAD_YEAR)
+max(DONATE$SP_MOST_RECENT_GRAD_YEAR)
+
+DONATE$SPOUSE_D1_GRAD_DATE <- NULL
+DONATE$SP_D2_GRAD_DATE <- NULL
+DONATE$SP_D3_GRAD_DATE <- NULL
+DONATE$SP_D4_GRAD_DATE <- NULL
+
+for (i in 1:length(DONATE$SP_MOST_RECENT_GRAD_YEAR)) {
+  if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1955 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1960) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1955-1960"} else
+    if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1960 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1965) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1960-1965"} else
+      if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1965 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1970) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1965-1970"} else
+        if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1970 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1975) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1970-1975"} else
+          if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1975 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1980) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1975-1980"} else
+            if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1980 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1985) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1980-1985"} else
+              if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1985 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1990) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1985-1990"} else
+                if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1990 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 1995) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1990-1995"} else
+                  if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 1995 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 2000) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "1995-2000"} else
+                    if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 2000 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 2005) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "2000-2005"} else
+                      if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 2005 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 2010) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "2005-2010"} else
+                        if (DONATE$SP_MOST_RECENT_GRAD_YEAR[i] >= 2010 & DONATE$SP_MOST_RECENT_GRAD_YEAR[i] < 2015) {DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN[i] <- "2010-2015"} else {DONATE$SP_MOST_RECENT_GRAD_YEAR[i] <- "None"} }
+
+DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN <- as.factor(DONATE$SP_MOST_RECENT_GRAD_YEAR_BIN)
+DONATE$SP_MOST_RECENT_GRAD_YEAR <- NULL
+
+#SP_D1_CAMPUS - SP_D4_CAMPUS
+levels(DONATE$SP_D1_CAMPUS)
+
+levels(DONATE$SP_D1_CAMPUS)[ which(levels(DONATE$SP_D1_CAMPUS) == " ") ] <- "None"
+levels(DONATE$SP_D1_CAMPUS)[ which(levels(DONATE$SP_D1_CAMPUS) == "UTN") ] <- "UTM"
+
+levels(DONATE$SP_D2_CAMPUS)
+levels(DONATE$SP_D2_CAMPUS)[ which(levels(DONATE$SP_D2_CAMPUS) == " ") ] <- "None"
+levels(DONATE$SP_D2_CAMPUS)[ which(levels(DONATE$SP_D2_CAMPUS) == "UTN") ] <- "UTM"
+
+levels(DONATE$SP_D3_CAMPUS)
+levels(DONATE$SP_D3_CAMPUS)[ which(levels(DONATE$SP_D3_CAMPUS) == " ") ] <- "None"
+
+levels(DONATE$SP_D4_CAMPUS)
+levels(DONATE$SP_D4_CAMPUS)[ which(levels(DONATE$SP_D4_CAMPUS) == " ") ] <- "None"
+
+#SP_D1_DEGREE - SP_D4_DEGREE
+levels(DONATE$SP_D1_DEGREE)
+levels(DONATE$SP_D1_DEGREE)[ which(levels(DONATE$SP_D1_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$SP_D2_DEGREE)
+levels(DONATE$SP_D2_DEGREE)[ which(levels(DONATE$SP_D2_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$SP_D3_DEGREE)
+levels(DONATE$SP_D3_DEGREE)[ which(levels(DONATE$SP_D3_DEGREE) == " ") ] <- "None"
+
+levels(DONATE$SP_D4_DEGREE)
+levels(DONATE$SP_D4_DEGREE)[ which(levels(DONATE$SP_D4_DEGREE) == " ") ] <- "None"
+
+#SP_D1_SCHOOL - SP_D4_SCHOOL
+levels(DONATE$SP_D1_SCHOOL)
+levels(DONATE$SP_D1_SCHOOL)[ which(levels(DONATE$SP_D1_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$SP_D2_SCHOOL)
+levels(DONATE$SP_D2_SCHOOL)[ which(levels(DONATE$SP_D2_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$SP_D3_SCHOOL)
+levels(DONATE$SP_D3_SCHOOL)[ which(levels(DONATE$SP_D3_SCHOOL) == " ") ] <- "None"
+
+levels(DONATE$SP_D4_SCHOOL)
+levels(DONATE$SP_D4_SCHOOL)[ which(levels(DONATE$SP_D4_SCHOOL) == " ") ] <- "None"
+
+#SP_D1_MAJOR
+length(levels(DONATE$SP_D1_MAJOR))
+levels(DONATE$SP_D1_MAJOR)[ which(levels(DONATE$SP_D1_MAJOR) == " ") ] <- "None"
+
+newlevels <- propose_levelsS19(DONATE[,c("SP_D1_MAJOR", "Donated_Dup")],method="tree",newname="Other",threshold=25,target=50)
+
+levels(newlevels)
+
+TR <- table(DONATE$SP_D1_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$SP_D1_MAJOR <- newlevels
+DONATE$SP_D1_MAJOR <- droplevels(DONATE$SP_D1_MAJOR)
+
+#SP_D2_MAJOR
+length(levels(DONATE$SP_D2_MAJOR))
+levels(DONATE$SP_D2_MAJOR)[ which(levels(DONATE$SP_D2_MAJOR) == " ") ] <- "None"
+
+newlevels <- propose_levelsS19(DONATE[,c("SP_D2_MAJOR", "Donated_Dup")],method="tree",newname="Other",threshold=25,target=50)
+
+levels(newlevels)
+
+TR <- table(DONATE$SP_D2_MAJOR,newlevels)
+OldToNew <- data.frame(NewLevel=unlist( apply(TR,1,function(x)names(which(x>0))) ) )
+NewToOld <- list(); for (i in levels(OldToNew$NewLevel) ) { NewToOld[[i]] <- rownames(subset(OldToNew,NewLevel==i)) }
+OldToNew
+NewToOld
+
+DONATE$SP_D2_MAJOR <- newlevels
+DONATE$SP_D2_MAJOR <- droplevels(DONATE$SP_D2_MAJOR)
+
+#SP_D3_MAJOR
+length(levels(DONATE$SP_D3_MAJOR))
+levels(DONATE$SP_D3_MAJOR)[ which(levels(DONATE$SP_D3_MAJOR) == " ") ] <- "None"
+
+#SP_D4_MAJOR
+levels(DONATE$SP_D4_MAJOR)
+levels(DONATE$SP_D4_MAJOR)[ which(levels(DONATE$SP_D4_MAJOR) == " ") ] <- "None"
+
+#SPOUSE_NON_UT_DEGREES
+levels(DONATE$SPOUSE_NON_UT_DEGREES)
+
+#RELATIONS_UT
+levels(DONATE$RELATIONS_UT) #missing and present
+
+#FRATERNITY.SORORITY
+levels(DONATE$FRATERNITY.SORORITY) #still a few multiple fraternity levels, not sure how to resolve
+
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "") ] <- "None"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK -  Alpha Epsilon Pi ") ] <- "UTK - Alpha Epsilon Pi"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK -  Alpha Tau Omega") ] <- "UTK - Alpha Tau Omega"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Alpha Delta Pi; UTK - Alpha Delta Pi") ] <- "UTK - Alpha Delta Pi"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Alpha Omicron Pi; UTK - Alpha Omicron Pi") ] <- "UTK - Alpha Omicron Pi"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Delta Delta Delta; UTK - Delta Delta Delta") ] <- "UTK - Delta Delta Delta"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Delta Sigma Theta; UTK - Delta Sigma Theta") ] <- "UTK - Delta Sigma Theta"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Kappa Alpha ") ] <- "UTK - Kappa Alpha"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Kappa Sigma; UTK - Kappa Sigma") ] <- "UTK - Kappa Sigma"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Phi Gamma Delta; UTK - Phi Beta Sigma") ] <- "UTK - Phi Gamma Delta"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Phi Gamma Delta; UTK - Phi Gamma Delta; UTK - Phi Gamma Delta") ] <- "UTK - Phi Gamma Delta"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Pi Beta Phi; UTK - Pi Beta Phi") ] <- "UTK - Pi Beta Phi"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Pi Kappa Alpha; UTK - Pi Kappa Alpha") ] <- "UTK - Pi Kappa Alpha"
+levels(DONATE$FRATERNITY.SORORITY)[ which(levels(DONATE$FRATERNITY.SORORITY) == "UTK - Sigma Nu; UTK - Sigma Nu") ] <- "UTK - Sigma Nu"
+
+#STUDENT.LIFE
+levels(DONATE$STUDENT.LIFE) #n and y
+
+#LTG2UT
+min(DONATE$LTG2UT)
+max(DONATE$LTG2UT)
+table(DONATE$LTG2UT)
+
+for (i in 1:length(DONATE$LTG2UT)) {
+  if (DONATE$LTG2UT[i] >= 1000000 ) {DONATE$LTG2UT_BIN[i] <- "1 Million+"} else
+    if (DONATE$LTG2UT[i] >= 500000 & DONATE$LTG2UT < 1000000) {DONATE$LTG2UT_BIN[i] <- "500K to 1 Million"} else
+      if (DONATE$LTG2UT[i] >= 250000 & DONATE$LTG2UT < 500000) {DONATE$LTG2UT_BIN[i] <- "250K to 500K"} else
+        if (DONATE$LTG2UT[i] >= 100000 & DONATE$LTG2UT < 250000) {DONATE$LTG2UT_BIN[i] <- "100K to 250K"} else
+          if (DONATE$LTG2UT[i] >= 75000 & DONATE$LTG2UT < 100000) {DONATE$LTG2UT_BIN[i] <- "75K to 100K"} else
+            if (DONATE$LTG2UT[i] >= 50000 & DONATE$LTG2UT < 75000) {DONATE$LTG2UT_BIN[i] <- "50K to 75K"} else
+              if (DONATE$LTG2UT[i] >= 25000 & DONATE$LTG2UT < 50000) {DONATE$LTG2UT_BIN[i] <- "25K to 50K"} else
+                if (DONATE$LTG2UT[i] >= 10000 & DONATE$LTG2UT < 25000) {DONATE$LTG2UT_BIN[i] <- "10K to 25K"} else
+                  if (DONATE$LTG2UT[i] >= 7500 & DONATE$LTG2UT < 10000) {DONATE$LTG2UT_BIN[i] <- "7500 to 25K"} else
+                    if (DONATE$LTG2UT[i] >= 5000 & DONATE$LTG2UT < 7500) {DONATE$LTG2UT_BIN[i] <- "5000 to 7500"} else
+                      if (DONATE$LTG2UT[i] >= 2500 & DONATE$LTG2UT < 5000) {DONATE$LTG2UT_BIN[i] <- "2500 to 5000"} else
+                         if (DONATE$LTG2UT[i] >= 1000 & DONATE$LTG2UT < 2500) {DONATE$LTG2UT_BIN[i] <- "1000 to 2500"} else
+                            if (DONATE$LTG2UT[i] >= 750 & DONATE$LTG2UT < 1000) {DONATE$LTG2UT_BIN[i] <- "750 to 1000"} else
+                               if (DONATE$LTG2UT[i] >= 500 & DONATE$LTG2UT < 750) {DONATE$LTG2UT_BIN[i] <- "500 to 750"} else
+                                  if (DONATE$LTG2UT[i] >= 100 & DONATE$LTG2UT < 500) {DONATE$LTG2UT_BIN[i] <- "100 to 500"} else {DONATE$LTG2UT_BIN[i] <- "Less Then 10"} }
+   
+table(DONATE$LTG2UT_BIN)
+
+DONATE$LTG2UT_BIN <- as.factor(DONATE$LTG2UT_BIN)
+DONATE$LTG2UT <- NULL
+
+#X1ST_GIFT_UT
+min(DONATE$X1ST_GIFT_UT) #year that the first gift was made
+max(DONATE$X1ST_GIFT_UT)
+table(DONATE$X1ST_GIFT_UT)
+DONATE$X1ST_GIFT_UT[which(is.na(DONATE$X1ST_GIFT_UT))] <- 0
+
+DONATE$X1ST_GIFT_UT <- as.factor(DONATE$X1ST_GIFT_UT)
+
+#YEARS2UT
+min(DONATE$YEARS2UT)
+max(DONATE$YEARS2UT)
+table(DONATE$YEARS2UT)
+
+DONATE$YEARS2UT <- as.factor(DONATE$YEARS2UT)
+
+#WE
+levels(DONATE$WE) #13 levels for wealth estimate
+
+#Donated
+levels(DONATE$Donated) #5000 NAs, make sure not to use LOGAMOUNT for predictions
+```
+
+```{r - AMOUNT Predictive Model}
+
+TRAIN <- AMOUNT[ !is.na(AMOUNT$LOGAMOUNT), ]
+HOLDOUT <- AMOUNT[ is.na(AMOUNT$LOGAMOUNT), ]
+
+TRAIN$LOGAMOUNT_DUP <- NULL
+TRAIN$ID <- NULL
+
+fitControl <- trainControl(method="cv",number=5, allowParallel = TRUE)
+
+#####################################
+#Random Forest 0.876638
+#####################################
+
+#It's rare you need to tune the mtry parameter, and it takes a LONG time to do so, but here's how its done
+#Remember that mtry is the number of randomly selected columns that are considered each time a new rule is
+#to be added to one of the trees in teh forest
+#If tuning is to be done, I highly recommend parallelization
+
+forestGrid <- expand.grid(mtry=c(24, 25))  #put in values, the number of randomly selected predictors in each model attempt
+
+#If you do NOT want parallelization, then don't run Lines1-4 (but do run train)
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+FOREST.AMOUNT <- train(LOGAMOUNT~.,data=TRAIN,method='rf',tuneGrid=forestGrid,
+                               trControl=fitControl, preProc = c("center", "scale"))
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+
+FOREST.AMOUNT  #Look at details of all fits
+plot(FOREST.AMOUNT) #See how error changes with choices
+FOREST.AMOUNT$bestTune #Gives best parameters
+FOREST.AMOUNT$results #Look at output in more detail (lets you see SDs)
+FOREST.AMOUNT$results[rownames(FOREST.AMOUNT$bestTune),]  #Just the row with the optimal choice of tuning parameter
+varImp(FOREST.AMOUNT)  #Variable importance scores from 0-100, more reliable than regression; seems to be a bug with caret that won't give these
+
+postResample(predict(FOREST.AMOUNT,newdata=HOLDOUT),HOLDOUT$LOGAMOUNT)  #Error on holdout sample for reference
+
+#####################################
+#Boosted Tree 0.871242
+#####################################
+#Very tuning intensive.  In general, good idea to set shinkage to a very low number, interaction depth
+#to between 1-5, and tune the number of trees, then try tuning n.minobsinnode or return interaction.depth
+#The choice of tuning parameters means a LOT.  Parallelization is recommend
+
+#gbmGrid <- expand.grid(n.trees=c(100,200,500),interaction.depth=1:4,shrinkage=c(.01,.001),n.minobsinnode=c(5,10)) #current best tune is shrink=0.01, depth=4, node=10, trees=500
+
+gbmGrid <- expand.grid(n.trees=c(750, 1000),interaction.depth=1:5,shrinkage=c(.01,.001),n.minobsinnode=c(5,10,15))
+
+#gbmGrid <- expand.grid(n.trees=1000,interaction.depth=4,shrinkage=.01,n.minobsinnode=5) #best fit so far - 0.006 RMSE
+
+#If you do NOT want parallelization, then don't run Lines1-4 (but do run train)
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+set.seed(5853); GBM.AMOUNT <- train(LOGAMOUNT~.,data=TRAIN, method='gbm',tuneGrid=gbmGrid,verbose=FALSE,
+                          trControl=fitControl, preProc = c("center", "scale"))
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+GBM.AMOUNT  #Look at details of all fits
+plot(GBM.AMOUNT) #See how error changes with choices
+GBM.AMOUNT$bestTune #Gives best parameters
+GBM.AMOUNT$results #Look at output in more detail (lets you see SDs)
+GBM.AMOUNT$results[rownames(GBM.AMOUNT$bestTune),]  #Just the row with the optimal choice of tuning parameter
+library(gbm) #Need to have gbm library loaded up to run #varImp since caret doesn't correctly import it fo rnow
+#varImp(GBM)  #Variable importance scores from 0-100
+
+postResample(predict(GBM.AMOUNT,newdata=HOLDOUT,n.trees=500),HOLDOUT$LOGAMOUNT)  #Error on holdout sample for reference; use same number of trees as optimal model
+
+#how to save results
+predictions <- predict(GBM.AMOUNT,newdata=HOLDOUT)
+SUBMISSION <- data.frame(ID=HOLDOUT$ID,LOGAMOUNT=predictions)
+write.csv(SUBMISSION,file="myamountpredictions.csv",row.names=FALSE)
+```
+
+```{r - DONATE Predictive Model}
+
+TRAIN <- DONATE[ !is.na(DONATE$Donated), ]
+HOLDOUT <- DONATE[ is.na(DONATE$Donated), ]
+
+TRAIN$Donated_Dup <- NULL
+TRAIN$ID <- NULL
+
+fitControl <- trainControl(method="cv",number=5, classProbs=TRUE, summaryFunction=twoClassSummary, allowParallel = TRUE) 
+
+#####################################
+#Random Forest 0.8817696
+#####################################
+
+#It's rare you need to tune the mtry parameter, and it takes a LONG time to do so, but here's how its done
+#Remember that mtry is the number of randomly selected columns that are considered each time a new rule is
+#to be added to one of the trees in teh forest
+#If tuning is to be done, I highly recommend parallelization
+
+forestGrid <- expand.grid(mtry=c(15,20,25))  #put in values 
+
+#If you do NOT want parallelization, then don't run Lines1-4 (but do run train)
+cluster <- makeCluster(detectCores() - 1) #Line 1 for parallelization
+registerDoParallel(cluster) #Line 2 for parallelization
+FOREST.DONATE <- train(Donated~.,data=TRAIN,method='rf',tuneGrid=forestGrid,
+                                        trControl=fitControl, preProc = c("center", "scale"))
+stopCluster(cluster) #Line 3 for parallelization
+registerDoSEQ() #Line 4 for parallelization
+
+FOREST.DONATE  #Look at details of all fits
+plot(FOREST.DONATE) #See how error changes with choices
+FOREST.DONATE$bestTune #Gives best parameters
+FOREST.DONATE$results #Look at output in more detail (lets you see SDs)
+FOREST.DONATE$results[rownames(FOREST.DONATE$bestTune),]  #Just the row with the optimal choice of tuning parameter
+#varImp(FOREST)  #Variable importance scores from 0-100, more reliable than regression; seems to be a bug with caret that won't give these
+
+postResample(predict(FOREST.DONATE,newdata=HOLDOUT),HOLDOUT$Quality)  #Error on holdout sample for reference
+
+predictions <- predict(FOREST.DONATE,newdata=HOLDOUT,type="prob")[,2]
+SUBMISSION <- data.frame(ID=HOLDOUT$ID,Donated=predictions)
+write.csv(SUBMISSION,file="mydonatepredictions.csv",row.names=FALSE)
+
+
+####################################################################################
+#Regularized logistic regression
+####################################################################################
+
+#Regularization somewhat solves the variable selection problem by penalizing the sizes
+#of coefficients of "unnecessary" predictors.  However, it doesn't solve the interactions
+#or transformation problem.  
+
+#MUST work with scaled data (mean 0 and standard deviation of 1), so pass argument to train that does
+#this automatically
+
+#Need to set up a grad of parameters to tune.  Each parameter can be between 0 and 1
+#Take extra special note of the . before alpha and lambda in the parameters
+glmnetGrid <- expand.grid(alpha = seq(0,1,.05),lambda = 10^seq(-4,-1,length=10))   
+
+set.seed(5853); GLMnet.DONATE <- train(Donated~.,data=TRAIN,method='glmnet', trControl=fitControl, tuneGrid=glmnetGrid,
+                               preProc = c("center", "scale"))
+GLMnet.DONATE  #Look at details of all fits
+plot(GLMnet.DONATE) #See how error changes with choices
+GLMnet.DONATE$bestTune #Gives best parameters
+GLMnet.DONATE$results #Look at output in more detail (lets you see SDs)
+GLMnet.DONATE$results[rownames(GLMnet.DONATE$bestTune),]  #Just the row with the optimal choice of tuning parameter
+
+#varImp(GLMnet)  #Variable importance scores from 0-100, unreliable when predictors are highly correlated
+
+postResample(predict(GLMnet.DONATE,newdata=HOLDOUT),HOLDOUT$Donated)  #Error on holdout sample for reference
+roc(HOLDOUT$Donated,predict(GLMnet.DONATE,newdata=HOLDOUT,type="prob")[,2])
+
+#####################################
+#K-nearest neighbors
+#####################################
+
+#Find the K nearest neighbors to an individual as classify as whichever class is the majority.  Categorical
+#predictors are automatically converted into sets of 1/0 indicator variables.  Neighbors are determined through
+#"Euclidean" distance, i.e., what a ruler would measure if individuals were locations on map
+
+#Tune values for number of neighbors
+knnGrid <- expand.grid(k=1:50)   
+set.seed(5853);  KNN.DONATE <- train(Donated~.,data=TRAIN, method='knn', trControl=fitControl,tuneGrid=knnGrid,
+                             preProc = c("center", "scale"))
+
+KNN.DONATE  #Look at details of all fits
+plot(KNN.DONATE) #See how error changes with choices
+KNN.DONATE$bestTune #Gives best parameters
+KNN.DONATE$results #Look at output in more detail (lets you see SDs)
+KNN.DONATE$results[rownames(KNN.DONATE$bestTune),]  #Just the row with the optimal choice of tuning parameter
+
+postResample(predict(KNN.DONATE,newdata=HOLDOUT),HOLDOUT$Donated)  #Error on holdout sample for reference
+roc(HOLDOUT$Donated,predict(KNN.DONATE,newdata=HOLDOUT,type="prob")[,2])
+```
+
